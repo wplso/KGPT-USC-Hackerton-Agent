@@ -1,0 +1,110 @@
+name: Deploy to Self-Hosted Server
+
+on:
+  push:
+    branches:
+      - main  # main 브랜치에 push할 때 실행
+      - master  # 또는 master 브랜치
+  workflow_dispatch:  # 수동 실행 가능
+
+jobs:
+  deploy:
+    runs-on: self-hosted  # self-hosted runner 사용
+    
+    steps:
+      - name: 📦 체크아웃 코드
+        uses: actions/checkout@v3
+        with:
+          clean: false  # 기존 파일 유지
+      
+      - name: 📝 현재 디렉토리 확인
+        run: |
+          echo "현재 디렉토리: $(pwd)"
+          echo "파일 목록:"
+          ls -la
+      
+      - name: 🔧 Node.js 버전 확인
+        run: |
+          echo "Node.js 버전: $(node -v)"
+          echo "npm 버전: $(npm -v)"
+      
+      - name: 📦 의존성 설치
+        run: |
+          echo "📦 npm 패키지 설치 중..."
+          npm install
+          echo "✅ 의존성 설치 완료"
+
+      - name: 🔐 .env 파일 생성
+        run: |
+          echo "Creating .env file with environment variables..."
+          cat > .env << EOF
+          # Server Configuration
+          PORT=${{ secrets.PORT }}
+          NODE_ENV=${{ secrets.NODE_ENV }}
+          
+          # MariaDB Configuration
+          DB_HOST=${{ secrets.DB_HOST }}
+          DB_PORT=${{ secrets.DB_PORT }}
+          DB_USER=${{ secrets.DB_USER }}
+          DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+          DB_NAME=${{ secrets.DB_NAME }}
+          
+          # AI Server Configuration
+          AI_SERVER_URL=${{ secrets.AI_SERVER_URL }}
+          
+          # Cloudinary Configuration
+          CLOUDINARY_CLOUD_NAME=${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY=${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET=${{ secrets.CLOUDINARY_API_SECRET }}
+
+          # 제미나이 API KEY Setting
+          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+          EOF
+          echo "✅ .env 파일이 생성되었습니다."
+      
+      - name: 🔍 환경 변수 파일 확인
+        run: |
+          if [ -f .env ]; then
+            echo "✅ .env 파일이 존재합니다."
+          else
+            echo "⚠️  .env 파일이 없습니다. 배포 전에 생성해주세요."
+            exit 1
+          fi
+      
+      - name: 🔄 PM2로 애플리케이션 재시작
+        run: |
+          # PM2가 설치되어 있는지 확인
+          if ! command -v pm2 &> /dev/null; then
+            echo "⚠️  PM2가 설치되어 있지 않습니다. 설치 중..."
+            npm install -g pm2
+          fi
+          
+          # PM2 프로세스 확인
+          if pm2 list | grep -q "bloomdent-api"; then
+            echo "🔄 기존 프로세스 재시작 중..."
+            pm2 restart bloomdent-api
+          else
+            echo "🚀 새로운 프로세스 시작 중..."
+            pm2 start server.js --name bloomdent-api
+          fi
+          
+          # PM2 상태 확인
+          pm2 list
+          echo "✅ 배포 완료!"
+      
+      - name: 💾 PM2 설정 저장
+        run: |
+          pm2 save
+          echo "✅ PM2 설정이 저장되었습니다."
+      
+      - name: 📊 배포 정보 출력
+        run: |
+          echo "======================================"
+          echo "🎉 배포가 성공적으로 완료되었습니다!"
+          echo "======================================"
+          echo "브랜치: ${{ github.ref_name }}"
+          echo "커밋: ${{ github.sha }}"
+          echo "작성자: ${{ github.actor }}"
+          echo "시간: $(date)"
+          echo "======================================"
+

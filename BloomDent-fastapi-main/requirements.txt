@@ -1,0 +1,8 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+# mediapipe 0.10.21 고정: 0.10.30+ 는 레거시 solutions API(mp.solutions.face_mesh) 제거됨
+mediapipe==0.10.21
+# mediapipe 가 opencv-contrib-python(cv2) 를 함께 설치하므로 opencv-python 은 넣지 않음(중복/충돌 방지)
+# mediapipe 0.10.21 은 numpy<2 필요
+numpy<2
+python-multipart>=0.0.20
