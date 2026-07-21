@@ -27,3 +27,6 @@ Thumbs.db
 # GitHub Actions (local testing)
 .github-actions-demo/
 
+.serena/
+.ua/
+

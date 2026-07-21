@@ -7,6 +7,10 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "setup-db": "node setup-database.js",
+    "migrate:agent": "node database/run-migration.js",
+    "migrate:agent:check": "node database/run-migration.js --dry-run",
+    "test:agent-migration": "node database/run-migration.test.js",
+    "test:agent-auth": "node middleware/agentDemoAuth.test.js",
     "migrate-position": "node database/migrate-position.js",
     "deploy": "bash deploy.sh"
   },

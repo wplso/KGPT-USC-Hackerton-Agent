@@ -25,6 +25,7 @@ const surveyRoutes = require('./routes/survey');
 const scoresRoutes = require('./routes/scores');
 const aiRoutes = require('./routes/ai');
 const surveyDetailRoutes = require('./routes/survey_detail');
+const agentRoutes = require('./routes/agent');
 
 
 app.use('/api', apiRoutes);
@@ -36,6 +37,7 @@ app.use('/api/survey', surveyRoutes);
 app.use('/api/scores', scoresRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/survey-detail', surveyDetailRoutes);
+app.use('/api/agent', agentRoutes);
 
 // 루트 경로
 app.get('/', (req, res) => {
