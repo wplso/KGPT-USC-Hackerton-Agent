@@ -37,6 +37,7 @@ const EXPECTED_AGENT_TABLES = [
   'agent_chat_history',
   'agent_tool_runs',
   'dental_passes',
+  'shopify_cart_requests',
 ];
 
 // 절대 허용하지 않는 파괴적 구문 패턴 (대소문자 무시, 주석 제거 후 검사)
@@ -123,6 +124,50 @@ const USER_SURVEY_RESPONSES_ALLOWED_ALTER_STATEMENT =
   /^ALTER\s+TABLE\s+`?user_survey_responses`?\s+ADD\s+UNIQUE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+`?uq_user_survey_response_question`?\s*\(\s*user_id\s*,\s*survey_session_id\s*,\s*question_number\s*\)$/i;
 
 // 003 적용 후 검증용으로도 재사용하는 상수(테스트에서 실제 003 파일 텍스트와 대조)
+// 004 적용 후 shopify_cart_requests 가 정확히 기대한 스키마인지 검증하기 위한
+// 명세. 이름만 확인하는 게 아니라 컬럼 타입/ENUM 순서/기본값/인덱스 구성/FK
+// CASCADE 까지 대조한다(verifyShopifyCartRequestsSchema).
+const SHOPIFY_CART_EXPECTED_COLUMNS = {
+  id: { type: 'char(36)', nullable: 'NO' },
+  user_id: { type: 'int', nullable: 'NO' },
+  session_id: { type: 'char(36)', nullable: 'NO' },
+  idempotency_key_hash: { type: 'char(64)', nullable: 'NO' },
+  request_hash: { type: 'char(64)', nullable: 'NO' },
+  proposal_hash: { type: 'char(64)', nullable: 'NO' },
+  shopify_config_fingerprint: { type: 'char(64)', nullable: 'NO' },
+  selected_items_json: { type: 'json', nullable: 'NO' },
+  status: { type: 'enum', nullable: 'NO' },
+  attempt_count: { type: 'tinyint', nullable: 'NO' },
+  shopify_cart_id: { type: 'varchar(255)', nullable: 'YES' },
+  checkout_url: { type: 'text', nullable: 'YES' },
+  estimated_total_amount: { type: 'varchar(64)', nullable: 'YES' },
+  estimated_total_currency_code: { type: 'varchar(16)', nullable: 'YES' },
+  estimated_total_is_estimated: { type: 'tinyint', nullable: 'YES' },
+  warning_codes_json: { type: 'json', nullable: 'YES' },
+  normalized_error_code: { type: 'varchar(80)', nullable: 'YES' },
+  normalized_http_status: { type: 'smallint', nullable: 'YES' },
+  safe_error_details_json: { type: 'json', nullable: 'YES' },
+  external_call_started_at: { type: 'timestamp(6)', nullable: 'YES' },
+  completed_at: { type: 'timestamp(6)', nullable: 'YES' },
+  created_at: { type: 'timestamp(6)', nullable: 'NO' },
+  updated_at: { type: 'timestamp(6)', nullable: 'NO' },
+};
+
+const SHOPIFY_CART_EXPECTED_STATUS_ENUM = ['pending', 'succeeded', 'failed', 'outcome_unknown'];
+
+// created_at/updated_at 은 반드시 애플리케이션 Clock 이 bind 해야 하므로
+// DB 자동 기본값/ON UPDATE 가 붙어 있으면 안 된다.
+const SHOPIFY_CART_APP_MANAGED_TIME_COLUMNS = ['created_at', 'updated_at'];
+
+const SHOPIFY_CART_EXPECTED_INDEXES = {
+  uq_shopify_cart_idempotency: { unique: true, columns: ['user_id', 'idempotency_key_hash'] },
+  idx_shopify_cart_session: { unique: false, columns: ['session_id'] },
+  idx_shopify_cart_status: { unique: false, columns: ['status'] },
+  idx_shopify_cart_pending: { unique: false, columns: ['status', 'external_call_started_at', 'created_at'] },
+};
+
+const SHOPIFY_CART_EXPECTED_FK_TABLES = ['users', 'agent_sessions'];
+
 const SURVEY_CATEGORY_EXPECTED_ENUM_VALUES = [
   '구강관리/양치습관',
   '구치/구강건조',
@@ -225,6 +270,132 @@ async function verifySurveyCodebookSchema(connection, dbName) {
   const indexOk = indexRows.length > 0;
 
   return { enumOk, indexOk, ok: enumOk && indexOk };
+}
+
+/**
+ * 004 적용 후 shopify_cart_requests 의 컬럼/타입/ENUM/기본값/인덱스/FK 를
+ * information_schema 로 정확히 검증한다. 이름 존재만 확인하지 않는다.
+ */
+async function verifyShopifyCartRequestsSchema(connection, dbName) {
+  const problems = [];
+
+  // 1) 컬럼 존재 + 타입 + nullable
+  const [columnRows] = await connection.query(
+    `SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA
+       FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'shopify_cart_requests'`,
+    [dbName]
+  );
+  const columnsByName = new Map(columnRows.map((r) => [r.COLUMN_NAME, r]));
+
+  for (const [name, expected] of Object.entries(SHOPIFY_CART_EXPECTED_COLUMNS)) {
+    const actual = columnsByName.get(name);
+    if (!actual) {
+      problems.push(`컬럼 누락: ${name}`);
+      continue;
+    }
+    // COLUMN_TYPE 은 'varchar(64)' / 'char(36)' / 'enum(...)' 처럼 길이까지 포함한다.
+    const actualType = String(actual.COLUMN_TYPE).toLowerCase();
+    const expectedType = expected.type.toLowerCase();
+    // MariaDB 는 JSON 을 LONGTEXT 별칭으로 저장하므로 둘 다 허용한다
+    // (기존 agent_sessions.context_snapshot 도 longtext 로 보고된다).
+    const typeOk =
+      expectedType === 'json'
+        ? actualType.startsWith('json') || actualType.startsWith('longtext')
+        : actualType.startsWith(expectedType);
+    if (!typeOk) {
+      problems.push(`컬럼 타입 불일치: ${name} (기대 ${expected.type}, 실제 ${actual.COLUMN_TYPE})`);
+    }
+    if (actual.IS_NULLABLE !== expected.nullable) {
+      problems.push(`컬럼 nullable 불일치: ${name} (기대 ${expected.nullable}, 실제 ${actual.IS_NULLABLE})`);
+    }
+  }
+
+  // 2) status ENUM 값과 순서
+  const statusColumn = columnsByName.get('status');
+  if (statusColumn) {
+    const enumValues = String(statusColumn.COLUMN_TYPE)
+      .replace(/^enum\(/i, '')
+      .replace(/\)$/, '')
+      .split(',')
+      .map((v) => v.trim().replace(/^'/, '').replace(/'$/, ''));
+    if (enumValues.join('|') !== SHOPIFY_CART_EXPECTED_STATUS_ENUM.join('|')) {
+      problems.push(`status ENUM 값/순서 불일치: 실제 [${enumValues.join(', ')}]`);
+    }
+  }
+
+  // 3) attempt_count 기본값 0
+  const attemptColumn = columnsByName.get('attempt_count');
+  if (attemptColumn && String(attemptColumn.COLUMN_DEFAULT) !== '0') {
+    problems.push(`attempt_count 기본값이 0이 아닙니다: ${attemptColumn.COLUMN_DEFAULT}`);
+  }
+
+  // 4) created_at/updated_at 에 DB 자동 기본값/ON UPDATE 가 없어야 한다
+  for (const name of SHOPIFY_CART_APP_MANAGED_TIME_COLUMNS) {
+    const column = columnsByName.get(name);
+    if (!column) continue;
+    if (column.COLUMN_DEFAULT !== null) {
+      problems.push(`${name} 에 DB 기본값이 설정돼 있습니다(애플리케이션 Clock 이 bind 해야 함): ${column.COLUMN_DEFAULT}`);
+    }
+    const extra = String(column.EXTRA || '').toLowerCase();
+    if (extra.includes('on update')) {
+      problems.push(`${name} 에 ON UPDATE 가 설정돼 있습니다(애플리케이션 Clock 이 bind 해야 함)`);
+    }
+  }
+
+  // 5) 인덱스 이름 + UNIQUE 여부 + 컬럼 구성/순서
+  const [indexRows] = await connection.query(
+    `SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME
+       FROM information_schema.STATISTICS
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'shopify_cart_requests'
+      ORDER BY INDEX_NAME, SEQ_IN_INDEX`,
+    [dbName]
+  );
+  const indexesByName = new Map();
+  for (const row of indexRows) {
+    if (!indexesByName.has(row.INDEX_NAME)) {
+      indexesByName.set(row.INDEX_NAME, { unique: row.NON_UNIQUE === 0, columns: [] });
+    }
+    indexesByName.get(row.INDEX_NAME).columns.push(row.COLUMN_NAME);
+  }
+
+  for (const [name, expected] of Object.entries(SHOPIFY_CART_EXPECTED_INDEXES)) {
+    const actual = indexesByName.get(name);
+    if (!actual) {
+      problems.push(`인덱스 누락: ${name}`);
+      continue;
+    }
+    if (actual.unique !== expected.unique) {
+      problems.push(`인덱스 UNIQUE 여부 불일치: ${name}`);
+    }
+    if (actual.columns.join('|') !== expected.columns.join('|')) {
+      problems.push(`인덱스 컬럼 구성 불일치: ${name} (실제 [${actual.columns.join(', ')}])`);
+    }
+  }
+
+  // 6) FK 2개 존재 + 둘 다 ON DELETE CASCADE
+  const [fkRows] = await connection.query(
+    `SELECT rc.CONSTRAINT_NAME, rc.DELETE_RULE, kcu.REFERENCED_TABLE_NAME
+       FROM information_schema.REFERENTIAL_CONSTRAINTS rc
+       JOIN information_schema.KEY_COLUMN_USAGE kcu
+         ON kcu.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA
+        AND kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+      WHERE rc.CONSTRAINT_SCHEMA = ? AND rc.TABLE_NAME = 'shopify_cart_requests'`,
+    [dbName]
+  );
+  const fkByReferencedTable = new Map(fkRows.map((r) => [r.REFERENCED_TABLE_NAME, r]));
+  for (const table of SHOPIFY_CART_EXPECTED_FK_TABLES) {
+    const fk = fkByReferencedTable.get(table);
+    if (!fk) {
+      problems.push(`FK 누락: ${table} 참조`);
+      continue;
+    }
+    if (String(fk.DELETE_RULE).toUpperCase() !== 'CASCADE') {
+      problems.push(`FK ON DELETE 규칙 불일치: ${table} (실제 ${fk.DELETE_RULE})`);
+    }
+  }
+
+  return { problems, ok: problems.length === 0 };
 }
 
 /**
@@ -431,6 +602,21 @@ async function main(argv = process.argv) {
       process.exit(1);
     }
 
+    // 7) 검증: 004 shopify_cart_requests 의 정확한 스키마(컬럼/타입/ENUM/기본값/인덱스/FK)
+    console.log('📋 shopify_cart_requests 스키마 정합성 검증 (004):');
+    const shopifyCartSchemaCheck = await verifyShopifyCartRequestsSchema(connection, process.env.DB_NAME);
+    if (shopifyCartSchemaCheck.ok) {
+      console.log('   ✅ 컬럼/타입/ENUM 순서/기본값/인덱스/FK CASCADE 모두 일치');
+    } else {
+      shopifyCartSchemaCheck.problems.forEach((p) => console.error(`   ❌ ${p}`));
+    }
+    console.log('');
+
+    if (!shopifyCartSchemaCheck.ok) {
+      console.error('❌ shopify_cart_requests 스키마가 004 기대값과 일치하지 않습니다.');
+      process.exit(1);
+    }
+
     console.log('🎉 Agent Migration 적용 및 검증 완료.');
   } catch (error) {
     console.error('\n❌ Migration 실행 중 오류:');
@@ -461,6 +647,12 @@ module.exports = {
   verifyAgentTablesExist,
   checkNoDuplicateSurveyResponses,
   verifySurveyCodebookSchema,
+  verifyShopifyCartRequestsSchema,
+  SHOPIFY_CART_EXPECTED_COLUMNS,
+  SHOPIFY_CART_EXPECTED_STATUS_ENUM,
+  SHOPIFY_CART_EXPECTED_INDEXES,
+  SHOPIFY_CART_EXPECTED_FK_TABLES,
+  SHOPIFY_CART_APP_MANAGED_TIME_COLUMNS,
   EXPECTED_AGENT_TABLES,
   IMAGE_ANALYSIS_EXPECTED_COLUMNS,
   IMAGE_ANALYSIS_EXPECTED_INDEXES,

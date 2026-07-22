@@ -463,12 +463,60 @@ Core DB에서 가져온 사용자 입력, 설문 자유 입력, AI 추천 문구
 > - 순수 함수 `agent/services/productRecommendationService.js`가 Gemini/Shopify를
 >   전혀 호출하지 않고 로컬에서 결정론적으로 추천 목록을 만든다.
 >
-> **6A-2 (예정, 아직 미구현)** — Shopify Storefront Adapter, `POST
-> /api/agent/sessions/:sessionId/shopify-cart`, Idempotency, cartCreate 연동.
-> **Shopify API 호출은 사용자 승인 없이는 수행하지 않으며, 설문 응답·임상정보·추천
-> evidence는 Shopify로 전달하지 않는다.** 신규 DB 테이블은
-> `database/migrations/004_create_shopify_cart_requests.sql`(migration 번호
-> 확정, 003 다음)로 예정돼 있다.
+> **6A-2 (오프라인 구현 완료, 실제 Shopify 호출 전 단계)** — Shopify Storefront
+> Adapter, `GET /api/agent/sessions/:sessionId/product-recommendations`,
+> `POST /api/agent/sessions/:sessionId/shopify-cart`, 로컬 Idempotency,
+> cartCreate 연동이 구현됐다. 신규 테이블은
+> `database/migrations/004_create_shopify_cart_requests.sql`(003 다음).
+> 구현 시점에 확정된 계약:
+>
+> - **인증 헤더**: 서버용 Private Storefront Token 은
+>   `Shopify-Storefront-Private-Token` 헤더로만 전송한다.
+>   `X-Shopify-Storefront-Access-Token`(Public Token 용)은 사용하지 않으며,
+>   Adapter 는 token 종류를 추측하지 않고 Private Token 만 지원한다.
+> - **Cart attributes 미사용**: cartCreate 에는 `lines[].merchandiseId` 와
+>   `quantity` 만 전송한다. Cart attributes/note/metafields/line attributes 를
+>   일절 보내지 않으며, `cart_request_id` 도 BloomDent DB 에만 저장한다.
+>   설문 응답(`survey.answers`)·임상정보·추천 evidence·reason_code·
+>   `cavity_detected`·Dental Pass 관련 값·비용 계산 결과는 Shopify 로 전달하지 않는다.
+> - **로컬 Idempotency source of truth**: Shopify 가 BloomDent 의 Idempotency-Key 를
+>   처리해준다고 가정하지 않는다. `shopify_cart_requests` 테이블이
+>   `UNIQUE(user_id, idempotency_key_hash)` 로 동시성을 직렬화하며, 상태는
+>   `pending → succeeded | failed | outcome_unknown` 로만 전이한다. Key 원문은
+>   저장·로그하지 않고 SHA-256 해시만 남긴다.
+> - **Mutation 재시도 금지**: cartCreate 는 DNS/ECONNRESET/timeout/429/5xx/파싱
+>   실패 등 어떤 오류에도 자동 재시도하지 않는다(`attempt_count` 최대 1).
+>   read-only Variant Query 만 제한적 retry 를 허용한다.
+> - **outcome_unknown**: 요청 전송 이후 결과가 불확실한 모든 경우(그리고 Shopify
+>   성공을 확인했지만 로컬 영속화가 실패한 경우)를 known failed 로 단정하지 않고
+>   `outcome_unknown` 으로 처리한다. 이 상태에서는 저장되지 않은 `checkout_url` 을
+>   반환하지 않고 같은 Key 로 Mutation 을 재호출하지 않는다.
+> - **추천과 구매 가능 여부 분리**: 추천 API 는 외부 호출이 0회이며 Shopify secret
+>   이나 Variant GID 가 전혀 없어도 정상 동작한다. 응답에는 전역 플래그
+>   `shopify_cart_api_enabled`(SHOPIFY_ENABLED 엄격 파싱 결과)와
+>   `all_recommended_variants_configured`, item 별 `shopify_variant_configured`
+>   (로컬에 형식 유효·중복 없는 GID 가 설정됐는지)만 담는다. 이 필드들은
+>   `availableForSale`/재고/게시 상태/가격/Checkout 성공을 보장하지 않으며
+>   `proposal_hash` 계산에도 포함되지 않는다. 실제 판매 가능 여부는 개발자용
+>   read-only CLI(`npm run shopify:verify-variants`), opt-in 통합 테스트,
+>   최종 cartCreate 의 `userErrors` 에서만 판정한다.
+> - **금액**: `cost.totalAmount { amount currencyCode }` 와
+>   `cost.totalAmountEstimated` 를 조회하며 `amount` 는 Decimal 문자열 그대로
+>   보존한다(Number/parseFloat 변환 금지). 응답 필드명은
+>   `estimated_cart_total` 이고 `pricing_disclaimer` 를 항상 함께 반환한다.
+>   `calculate_oop_cost` 결과와 합산·비교하지 않는다.
+> - **Buyer IP 는 운영 전 보완 항목**: V1 데모에서는
+>   `Shopify-Storefront-Buyer-IP` 헤더를 보내지 않는다(현재 Express `trust proxy`
+>   가 안전하게 검증되지 않았고 `X-Forwarded-For` 를 그대로 신뢰할 수 없기 때문).
+>   이는 최종 운영 정책이 아니라 **V1 한시적 생략**이며, 운영 전에 ①실제 reverse
+>   proxy 구조 확인 ②`trust proxy` 를 정확한 hop 또는 CIDR 로 제한 ③검증된
+>   `req.ip` 만 사용 ④그 이후 헤더 전달(임의 request 헤더 원문 전달 금지) 순서로
+>   반드시 보완해야 한다.
+> - **6C 는 수동 데모 Checkout**: 6A-2 의 자동 완료 조건은 유효한 `checkoutUrl`
+>   생성까지다. Checkout 폼 자동 입력, 결제 자동 완료, Admin Order API 호출,
+>   결제 Capture 는 하지 않는다. Bogus Gateway 를 통한 Checkout 완료 확인은
+>   6C 에서 사용자가 브라우저로 직접 수행한다. Storefront API 에는 생성된 Cart 를
+>   삭제하는 작업이 없으므로 통합 테스트가 남긴 테스트 Cart 는 정리 대상이 아니다.
 
 ### 목적
 
