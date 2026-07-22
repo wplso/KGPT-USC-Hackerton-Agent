@@ -427,6 +427,49 @@ Core DB에서 가져온 사용자 입력, 설문 자유 입력, AI 추천 문구
 
 ## 5.2 `create_shopify_cart`
 
+> ⚠️ **Superseded for V1 — 6A는 6A-1과 6A-2로 분리 구현 (2026-07 승인)**
+>
+> 아래 §5.2 원본 스펙(단일 `create_shopify_cart` Tool)은 구현 단계에서 **6A-1(완료)**과
+> **6A-2(예정)**로 분리됐다. 이 노트는 실제 구현이 원본 스펙과 다르다는 사실만
+> 기록하며, 원본 스펙 자체는 향후 참고를 위해 아래에 그대로 남겨둔다.
+>
+> **6A-1 (완료) — 문진표 기반 개인화 상품 추천 선행 작업**
+> - 상품 추천 근거는 `user_health_scores`의 **카테고리 합산 점수가 아니라**,
+>   Context Snapshot v2에 담긴 **개별 설문 응답**(`survey.answers`)이다.
+>   Codebook 버전 `oral-health-questionnaire-v1`(첨부 구강검진 문진표 1~15번,
+>   `agent/catalog/surveyCodebook.js`)을 canonical spec으로 사용한다.
+> - 이 Codebook 15개 문항은 임상 배점이 없는 **"비점수 문진"**이다. Core
+>   `survey_question_options.category` ENUM에 `'비점수 문진'` 값을 append-only로
+>   추가했다(`database/migrations/003_extend_survey_for_agent_codebook.sql`).
+>   응답 세션의 모든 문항이 `category='비점수 문진'`이고 대응하는
+>   `survey_questions.max_score`도 전부 0이면(`totalMax===0` 산술 하나만으로 판정하지
+>   않음), `routes/survey.js`는 `user_health_scores`/`score_history`를 **생성하지
+>   않는다**(`scoring_status:"not_applicable"`) — 오해성 0점이 `GET /api/scores/*`,
+>   leaderboard, chart에 노출되는 것을 방지하기 위함이다. **기존 배점 있는 설문
+>   (category가 기존 6개 중 하나이거나 max_score>0)은 기존 점수 계산 동작을 그대로
+>   유지한다** — 사용자가 0점 선택지를 골랐다는 이유만으로 `not_applicable`로
+>   오판하지 않도록 명시적으로 구분해 검증했다.
+> - `user_survey_responses`에 `(user_id, survey_session_id, question_number)`
+>   UNIQUE 제약(`uq_user_survey_response_question`)을 추가해 문항당 중복 응답을
+>   DB 레벨에서도 차단한다. `POST /api/survey/submit`도 요청 안 중복
+>   `question_number`를 저장 전에 400으로 거부한다.
+> - Context Snapshot은 `schema_version:"agent-context-v2"`로 확장됐다: `survey`에
+>   `codebook_version`, `codebook_checksum`, Allowlist 6개 question_code로 제한된
+>   `answers[]`만 포함하고 `category_scores`는 포함하지 않는다. `needs_clinical_followup`/
+>   `followup_reason_codes`는 서버가 결정론적으로 계산하는 파생 필드다(Gemini 미관여,
+>   진단·응급 판단 아님). **기존(schema_version 없는) v1 Session과 그 `context_hash`는
+>   전혀 재계산되지 않고 그대로 유지된다** — `computeContextHash`는 저장된 Snapshot
+>   객체를 그대로 해시할 뿐 필드 존재를 강제하지 않으므로 하위 호환된다.
+> - 순수 함수 `agent/services/productRecommendationService.js`가 Gemini/Shopify를
+>   전혀 호출하지 않고 로컬에서 결정론적으로 추천 목록을 만든다.
+>
+> **6A-2 (예정, 아직 미구현)** — Shopify Storefront Adapter, `POST
+> /api/agent/sessions/:sessionId/shopify-cart`, Idempotency, cartCreate 연동.
+> **Shopify API 호출은 사용자 승인 없이는 수행하지 않으며, 설문 응답·임상정보·추천
+> evidence는 Shopify로 전달하지 않는다.** 신규 DB 테이블은
+> `database/migrations/004_create_shopify_cart_requests.sql`(migration 번호
+> 확정, 003 다음)로 예정돼 있다.
+
 ### 목적
 
 서버가 허용한 제품 Variant만 사용하여 선택적 구강 관리 장바구니를 만들고 Checkout URL을 반환한다.

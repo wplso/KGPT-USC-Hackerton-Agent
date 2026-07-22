@@ -12,6 +12,7 @@ const {
   decideReadiness,
   pickLatestPerPosition,
   buildInitialMessage,
+  buildSurveyAnswersOrError,
   buildContextSnapshot,
   computeContextHash,
 } = require('./contextSnapshotService');
@@ -230,7 +231,7 @@ function baseSnapshotInput(overrides = {}) {
     historyId: 'history-1',
     surveySessionId: null,
     imagesByPosition,
-    surveyResponseRows: [],
+    surveyInfo: buildSurveyAnswersOrError([]),
     generatedAt: '2026-07-20T00:00:00.000Z',
     ...overrides,
   };
@@ -261,9 +262,120 @@ test('객체 키 삽입 순서가 달라도 context_hash는 동일하다 (canoni
     survey: snapshotA.survey,
     survey_session_id: snapshotA.survey_session_id,
     history_id: snapshotA.history_id,
+    schema_version: snapshotA.schema_version,
+    needs_clinical_followup: snapshotA.needs_clinical_followup,
+    followup_reason_codes: snapshotA.followup_reason_codes,
     generated_at: '2099-01-01T00:00:00.000Z',
   };
   assert.strictEqual(computeContextHash(snapshotA), computeContextHash(snapshotBReordered));
+});
+
+// ---------------------------------------------------------------------------
+// Context Snapshot v2 (buildSurveyAnswersOrError / buildContextSnapshot)
+// ---------------------------------------------------------------------------
+
+test('설문 응답이 없으면(빈 배열) survey:null, needs_clinical_followup:false다', () => {
+  const info = buildSurveyAnswersOrError([]);
+  assert.deepStrictEqual(info, { ok: true, survey: null, needsClinicalFollowup: false, followupReasonCodes: [] });
+});
+
+test('신규 Session의 Context Snapshot은 schema_version: agent-context-v2 를 갖는다', () => {
+  const snapshot = buildContextSnapshot(baseSnapshotInput());
+  assert.strictEqual(snapshot.schema_version, 'agent-context-v2');
+});
+
+test('Allowlist 밖 문항(SMOKING_STATUS 등)은 survey.answers에 포함되지 않는다', () => {
+  const info = buildSurveyAnswersOrError([
+    { question_number: 15, option_number: 1, category: '비점수 문진', score: 0 }, // SMOKING_STATUS
+    { question_number: 12, option_number: 2, category: '비점수 문진', score: 0 }, // FLUORIDE_TOOTHPASTE_STATUS(Allowlist)
+  ]);
+  assert.strictEqual(info.ok, true);
+  assert.deepStrictEqual(info.survey.answers, [{ question_code: 'FLUORIDE_TOOTHPASTE_STATUS', answer_code: 'NO' }]);
+});
+
+test('응답 순서가 달라도 동일한 응답 집합이면 context_hash가 같다', () => {
+  const rowsA = [
+    { question_number: 6, option_number: 1, category: '비점수 문진', score: 0 },
+    { question_number: 11, option_number: 4, category: '비점수 문진', score: 0 },
+  ];
+  const rowsB = [
+    { question_number: 11, option_number: 4, category: '비점수 문진', score: 0 },
+    { question_number: 6, option_number: 1, category: '비점수 문진', score: 0 },
+  ];
+  const snapshotA = buildContextSnapshot(baseSnapshotInput({ surveyInfo: buildSurveyAnswersOrError(rowsA) }));
+  const snapshotB = buildContextSnapshot(baseSnapshotInput({ surveyInfo: buildSurveyAnswersOrError(rowsB) }));
+  assert.strictEqual(computeContextHash(snapshotA), computeContextHash(snapshotB));
+});
+
+test('동일 question_number 중복 응답은 buildSurveyAnswersOrError가 실패로 감지한다(부분 Snapshot 생성 안 함)', () => {
+  const info = buildSurveyAnswersOrError([
+    { question_number: 1, option_number: 1, category: '비점수 문진', score: 0 },
+    { question_number: 1, option_number: 2, category: '비점수 문진', score: 0 },
+  ]);
+  assert.deepStrictEqual(info, { ok: false, code: 'AGENT_SURVEY_RESPONSE_DUPLICATE' });
+});
+
+test('코드북 밖 question_number는 AGENT_SURVEY_MAPPING_UNSUPPORTED로 실패한다', () => {
+  const info = buildSurveyAnswersOrError([{ question_number: 999, option_number: 1, category: '비점수 문진', score: 0 }]);
+  assert.deepStrictEqual(info, { ok: false, code: 'AGENT_SURVEY_MAPPING_UNSUPPORTED' });
+});
+
+test('DB category/score가 코드북과 다르면 AGENT_SURVEY_CODEBOOK_MISMATCH로 실패한다', () => {
+  const info = buildSurveyAnswersOrError([{ question_number: 1, option_number: 1, category: '구강관리/양치습관', score: 5 }]);
+  assert.deepStrictEqual(info, { ok: false, code: 'AGENT_SURVEY_CODEBOOK_MISMATCH' });
+});
+
+test('기존(v1) Snapshot 형태를 그대로 넣어도 computeContextHash는 정상 동작한다(하위 호환)', () => {
+  // schema_version/needs_clinical_followup 필드가 아예 없는 과거 형태의 객체.
+  const legacyV1Snapshot = {
+    history_id: 'history-1',
+    survey_session_id: null,
+    generated_at: '2026-01-01T00:00:00.000Z',
+    images: [],
+    survey: null,
+    initial_message: { text: 'x', evidence: [] },
+  };
+  const hash1 = computeContextHash(legacyV1Snapshot);
+  const hash2 = computeContextHash({ ...legacyV1Snapshot, generated_at: '2099-01-01T00:00:00.000Z' });
+  assert.strictEqual(hash1, hash2); // generated_at 제외 정책은 v1/v2 공통으로 그대로 유지됨
+  assert.strictEqual(typeof hash1, 'string');
+  assert.strictEqual(hash1.length, 64);
+});
+
+// -------------------- needs_clinical_followup 파생 규칙 --------------------
+
+test('CHEWING_DISCOMFORT/TOOTH_PAIN/GUM_PAIN=YES, SELF_RATED=POOR면 4개 followup_reason_codes가 모두 나온다', () => {
+  const info = buildSurveyAnswersOrError([
+    { question_number: 4, option_number: 1, category: '비점수 문진', score: 0 }, // CHEWING_DISCOMFORT YES
+    { question_number: 5, option_number: 1, category: '비점수 문진', score: 0 }, // TOOTH_PAIN YES
+    { question_number: 6, option_number: 1, category: '비점수 문진', score: 0 }, // GUM_PAIN YES
+    { question_number: 7, option_number: 4, category: '비점수 문진', score: 0 }, // SELF_RATED POOR
+  ]);
+  assert.strictEqual(info.ok, true);
+  assert.strictEqual(info.needsClinicalFollowup, true);
+  assert.deepStrictEqual(info.followupReasonCodes, [
+    'RECENT_CHEWING_DISCOMFORT',
+    'RECENT_TOOTH_PAIN',
+    'RECENT_GUM_PAIN_OR_BLEEDING',
+    'SELF_RATED_ORAL_HEALTH_POOR',
+  ]);
+});
+
+test('모두 NO/양호면 needs_clinical_followup은 false다', () => {
+  const info = buildSurveyAnswersOrError([
+    { question_number: 4, option_number: 2, category: '비점수 문진', score: 0 }, // NO
+    { question_number: 5, option_number: 2, category: '비점수 문진', score: 0 }, // NO
+    { question_number: 6, option_number: 2, category: '비점수 문진', score: 0 }, // NO
+    { question_number: 7, option_number: 1, category: '비점수 문진', score: 0 }, // VERY_GOOD
+  ]);
+  assert.strictEqual(info.needsClinicalFollowup, false);
+  assert.deepStrictEqual(info.followupReasonCodes, []);
+});
+
+test('Q5=YES만 있어도 TOOTHPASTE_SENSITIVE 관련 필드는 어디에도 생기지 않는다(followup만 생성)', () => {
+  const info = buildSurveyAnswersOrError([{ question_number: 5, option_number: 1, category: '비점수 문진', score: 0 }]);
+  assert.deepStrictEqual(info.followupReasonCodes, ['RECENT_TOOTH_PAIN']);
+  assert.ok(!JSON.stringify(info).includes('SENSITIVE'));
 });
 
 console.log(`\n🎉 ${passed}개 테스트 통과`);

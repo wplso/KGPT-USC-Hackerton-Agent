@@ -1,10 +1,29 @@
 const crypto = require('crypto');
+const { canonicalStringify } = require('../shared/canonicalJson');
+const {
+  CODEBOOK_VERSION,
+  CODEBOOK_CHECKSUM,
+  validateAndMapResponses,
+  filterAllowlistedAnswers,
+} = require('../catalog/surveyCodebook');
 
 const POSITIONS = ['upper', 'lower', 'front'];
 const PENDING_STATUSES = ['pending', 'processing'];
 
 const MODEL_NAME_PLACEHOLDER = 'template-only';
 const PROMPT_VERSION_PLACEHOLDER = 'v0';
+
+const SNAPSHOT_SCHEMA_VERSION = 'agent-context-v2';
+
+// question_code=YES(또는 POOR 계열) 응답을 임상 follow-up 권고로 변환하는
+// 결정론적 규칙. 서버가 계산하며 Gemini는 관여하지 않는다. 순서는 고정
+// (규칙 선언 순서)이라 입력 순서와 무관하게 항상 동일한 배열이 나온다.
+const CLINICAL_FOLLOWUP_RULES = [
+  { question_code: 'CHEWING_DISCOMFORT_LAST_3_MONTHS', matches: (a) => a === 'YES', reason_code: 'RECENT_CHEWING_DISCOMFORT' },
+  { question_code: 'TOOTH_PAIN_LAST_3_MONTHS', matches: (a) => a === 'YES', reason_code: 'RECENT_TOOTH_PAIN' },
+  { question_code: 'GUM_PAIN_OR_BLEEDING_LAST_3_MONTHS', matches: (a) => a === 'YES', reason_code: 'RECENT_GUM_PAIN_OR_BLEEDING' },
+  { question_code: 'SELF_RATED_ORAL_HEALTH', matches: (a) => a === 'POOR' || a === 'VERY_POOR', reason_code: 'SELF_RATED_ORAL_HEALTH_POOR' },
+];
 
 const DIAGNOSIS_DISCLAIMER =
   '이 내용은 AI가 사진과 설문을 바탕으로 정리한 참고 정보이며 확정 진단이 아닙니다. 정확한 진단과 치료 계획은 반드시 치과에서 임상 검사를 받아 확인해야 합니다.';
@@ -99,11 +118,59 @@ function buildInitialMessage(images) {
   };
 }
 
+// question_code=YES/POOR 계열 응답으로부터 임상 follow-up reason_code
+// 배열을 결정론적으로 계산한다(규칙 선언 순서 고정, 입력 순서 무관).
+// DB/Express에 의존하지 않는 순수 함수.
+function deriveClinicalFollowup(answers) {
+  const byCode = new Map((answers || []).map((a) => [a.question_code, a.answer_code]));
+  const reasonCodes = [];
+  for (const rule of CLINICAL_FOLLOWUP_RULES) {
+    const answerCode = byCode.get(rule.question_code);
+    if (answerCode !== undefined && rule.matches(answerCode)) {
+      reasonCodes.push(rule.reason_code);
+    }
+  }
+  return reasonCodes;
+}
+
+/**
+ * Core에서 읽은 원시 설문 응답 행을 Codebook으로 검증·매핑하고, Context
+ * Snapshot v2에 들어갈 survey/needs_clinical_followup/followup_reason_codes를
+ * 계산한다. DB를 다시 읽거나 쓰지 않는 순수 함수(surveyResponseRows만 입력).
+ *
+ * 반환: { ok: true, survey, needsClinicalFollowup, followupReasonCodes }
+ *     | { ok: false, code: 'AGENT_SURVEY_RESPONSE_DUPLICATE' | 'AGENT_SURVEY_MAPPING_UNSUPPORTED' | 'AGENT_SURVEY_CODEBOOK_MISMATCH' }
+ */
+function buildSurveyAnswersOrError(surveyResponseRows) {
+  if (!surveyResponseRows || surveyResponseRows.length === 0) {
+    return { ok: true, survey: null, needsClinicalFollowup: false, followupReasonCodes: [] };
+  }
+
+  const mapped = validateAndMapResponses(surveyResponseRows);
+  if (!mapped.ok) {
+    return { ok: false, code: mapped.code };
+  }
+
+  const allowlistedAnswers = filterAllowlistedAnswers(mapped.answers);
+  const followupReasonCodes = deriveClinicalFollowup(allowlistedAnswers);
+
+  return {
+    ok: true,
+    survey: {
+      codebook_version: CODEBOOK_VERSION,
+      codebook_checksum: CODEBOOK_CHECKSUM,
+      answers: allowlistedAnswers,
+    },
+    needsClinicalFollowup: followupReasonCodes.length > 0,
+    followupReasonCodes,
+  };
+}
+
 function buildContextSnapshot({
   historyId,
   surveySessionId,
   imagesByPosition,
-  surveyResponseRows,
+  surveyInfo,
   generatedAt,
 }) {
   const images = POSITIONS.map((position) => {
@@ -120,41 +187,19 @@ function buildContextSnapshot({
     };
   });
 
-  const survey = surveySessionId
-    ? {
-        survey_session_id: surveySessionId,
-        responses: (surveyResponseRows || []).map((row) => ({ category: row.category, score: row.score })),
-      }
-    : null;
+  const resolvedSurveyInfo = surveyInfo || { survey: null, needsClinicalFollowup: false, followupReasonCodes: [] };
 
   return {
+    schema_version: SNAPSHOT_SCHEMA_VERSION,
     history_id: historyId,
     survey_session_id: surveySessionId || null,
     generated_at: generatedAt || new Date().toISOString(),
     images,
-    survey,
+    survey: resolvedSurveyInfo.survey,
+    needs_clinical_followup: resolvedSurveyInfo.needsClinicalFollowup,
+    followup_reason_codes: resolvedSurveyInfo.followupReasonCodes,
     initial_message: buildInitialMessage(images),
   };
-}
-
-// 객체 키를 재귀적으로 정렬해 삽입 순서에 무관한 canonical 표현을 만든다.
-function canonicalize(value) {
-  if (Array.isArray(value)) {
-    return value.map(canonicalize);
-  }
-  if (value !== null && typeof value === 'object') {
-    const sortedKeys = Object.keys(value).sort();
-    const result = {};
-    for (const key of sortedKeys) {
-      result[key] = canonicalize(value[key]);
-    }
-    return result;
-  }
-  return value;
-}
-
-function canonicalStringify(value) {
-  return JSON.stringify(canonicalize(value));
 }
 
 // generated_at을 제외한 근거 데이터만 해시해 동일한 근거 데이터는 생성 시각과 무관하게 동일 해시가 나오게 한다.
@@ -167,9 +212,12 @@ module.exports = {
   POSITIONS,
   MODEL_NAME_PLACEHOLDER,
   PROMPT_VERSION_PLACEHOLDER,
+  SNAPSHOT_SCHEMA_VERSION,
   pickLatestPerPosition,
   decideReadiness,
   buildInitialMessage,
+  buildSurveyAnswersOrError,
+  deriveClinicalFollowup,
   buildContextSnapshot,
   canonicalStringify,
   computeContextHash,

@@ -16,9 +16,15 @@ const {
   findSafetyViolations,
   isSafeImageAnalysisAlterStatement,
   loadMigrationFiles,
+  checkNoDuplicateSurveyResponses,
+  verifySurveyCodebookSchema,
   EXPECTED_AGENT_TABLES,
   IMAGE_ANALYSIS_EXPECTED_COLUMNS,
   IMAGE_ANALYSIS_EXPECTED_INDEXES,
+  SURVEY_QUESTION_OPTIONS_ALLOWED_ALTER_STATEMENT,
+  USER_SURVEY_RESPONSES_ALLOWED_ALTER_STATEMENT,
+  SURVEY_CATEGORY_EXPECTED_ENUM_VALUES,
+  USER_SURVEY_RESPONSE_EXPECTED_UNIQUE_INDEX,
   MIGRATIONS_DIR,
 } = require('./run-migration');
 
@@ -233,4 +239,132 @@ test('IMAGE_ANALYSIS_EXPECTED_COLUMNS/INDEXES 는 실제 002 파일 텍스트와
   }
 });
 
-console.log(`\n🎉 ${passed}개 테스트 통과`);
+// ---------------------------------------------------------------------------
+// 003_extend_survey_for_agent_codebook.sql 전용 테스트
+// ---------------------------------------------------------------------------
+
+test('실제 003_extend_survey_for_agent_codebook.sql 은 위반이 없다', () => {
+  const sql = fs.readFileSync(
+    path.join(MIGRATIONS_DIR, '003_extend_survey_for_agent_codebook.sql'),
+    'utf8'
+  );
+  assert.deepStrictEqual(findSafetyViolations(sql), []);
+});
+
+test('loadMigrationFiles 는 003을 002 다음 순서로 포함한다', () => {
+  const files = loadMigrationFiles();
+  assert.ok(files.includes('003_extend_survey_for_agent_codebook.sql'));
+  const indexOf002 = files.indexOf('002_align_image_analysis_schema.sql');
+  const indexOf003 = files.indexOf('003_extend_survey_for_agent_codebook.sql');
+  assert.ok(indexOf002 < indexOf003);
+});
+
+test('003이 실제로 쓰는 category MODIFY COLUMN 문장은 허용된다', () => {
+  const sql =
+    "ALTER TABLE survey_question_options MODIFY COLUMN category ENUM('구강관리/양치습관','구치/구강건조','흡연/음주','우식성 식품 섭취','지각과민/불소','구강악습관','비점수 문진') NOT NULL COMMENT '카테고리(비점수 문진: 임상 배점 없는 문진, 건강 점수 계산에서 제외)';";
+  assert.deepStrictEqual(findSafetyViolations(sql), []);
+  assert.strictEqual(SURVEY_QUESTION_OPTIONS_ALLOWED_ALTER_STATEMENT.test(sql.replace(/;$/, '')), true);
+});
+
+test('003이 실제로 쓰는 UNIQUE INDEX 문장은 허용된다', () => {
+  const sql =
+    'ALTER TABLE user_survey_responses ADD UNIQUE INDEX IF NOT EXISTS uq_user_survey_response_question (user_id, survey_session_id, question_number);';
+  assert.deepStrictEqual(findSafetyViolations(sql), []);
+  assert.strictEqual(USER_SURVEY_RESPONSES_ALLOWED_ALTER_STATEMENT.test(sql.replace(/;$/, '')), true);
+});
+
+test('category ENUM 값 순서를 바꾸거나 기존 값을 제거하는 MODIFY는 차단된다', () => {
+  const sql =
+    "ALTER TABLE survey_question_options MODIFY COLUMN category ENUM('비점수 문진','구강관리/양치습관','구치/구강건조','흡연/음주','우식성 식품 섭취','지각과민/불소','구강악습관') NOT NULL;";
+  const v = findSafetyViolations(sql);
+  assert.ok(v.some((x) => x.includes('survey_question_options')), v.join(','));
+});
+
+test('허용된 이름/컬럼 구성이 아닌 UNIQUE INDEX 추가는 차단된다', () => {
+  const sql =
+    'ALTER TABLE user_survey_responses ADD UNIQUE INDEX IF NOT EXISTS uq_something_else (user_id, question_number);';
+  const v = findSafetyViolations(sql);
+  assert.ok(v.some((x) => x.includes('user_survey_responses')), v.join(','));
+});
+
+test('survey_question_options/user_survey_responses 에 대한 그 외 임의 ALTER는 여전히 차단된다', () => {
+  const v1 = findSafetyViolations('ALTER TABLE survey_question_options ADD COLUMN foo INT;');
+  assert.ok(v1.some((x) => x.includes('survey_question_options')), v1.join(','));
+  const v2 = findSafetyViolations('ALTER TABLE user_survey_responses DROP COLUMN score;');
+  assert.ok(v2.some((x) => x.includes('user_survey_responses')), v2.join(','));
+});
+
+test('SURVEY_CATEGORY_EXPECTED_ENUM_VALUES는 실제 003 파일 텍스트와 일치한다', () => {
+  const sql = fs.readFileSync(
+    path.join(MIGRATIONS_DIR, '003_extend_survey_for_agent_codebook.sql'),
+    'utf8'
+  );
+  for (const value of SURVEY_CATEGORY_EXPECTED_ENUM_VALUES) {
+    assert.ok(sql.includes(value), `003 파일에 category 값 ${value} 이 없습니다`);
+  }
+  assert.ok(sql.includes(USER_SURVEY_RESPONSE_EXPECTED_UNIQUE_INDEX));
+});
+
+function asyncTest(name, fn) {
+  return fn().then(() => {
+    passed += 1;
+    console.log(`  ✅ ${name}`);
+  });
+}
+
+async function runAsyncTests() {
+  console.log('');
+  console.log('run-migration 비동기(DB mock) 가드 테스트\n');
+
+  await asyncTest('checkNoDuplicateSurveyResponses: 중복 없으면 ok:true', async () => {
+    const fakeConnection = { query: async () => [[]] };
+    const result = await checkNoDuplicateSurveyResponses(fakeConnection);
+    assert.deepStrictEqual(result, { duplicates: [], ok: true });
+  });
+
+  await asyncTest('checkNoDuplicateSurveyResponses: 중복 있으면 ok:false + 목록 반환', async () => {
+    const fakeRows = [{ user_id: 1, survey_session_id: 's1', question_number: 5, c: 2 }];
+    const fakeConnection = { query: async () => [fakeRows] };
+    const result = await checkNoDuplicateSurveyResponses(fakeConnection);
+    assert.strictEqual(result.ok, false);
+    assert.deepStrictEqual(result.duplicates, fakeRows);
+  });
+
+  await asyncTest('verifySurveyCodebookSchema: ENUM/INDEX 둘 다 있으면 ok:true', async () => {
+    let call = 0;
+    const fakeConnection = {
+      query: async () => {
+        call += 1;
+        if (call === 1) {
+          return [[{ COLUMN_TYPE: "enum('구강관리/양치습관','구치/구강건조','흡연/음주','우식성 식품 섭취','지각과민/불소','구강악습관','비점수 문진')" }]];
+        }
+        return [[{ INDEX_NAME: 'uq_user_survey_response_question' }]];
+      },
+    };
+    const result = await verifySurveyCodebookSchema(fakeConnection, 'bloomdent_test');
+    assert.deepStrictEqual(result, { enumOk: true, indexOk: true, ok: true });
+  });
+
+  await asyncTest('verifySurveyCodebookSchema: 인덱스가 없으면 ok:false', async () => {
+    let call = 0;
+    const fakeConnection = {
+      query: async () => {
+        call += 1;
+        if (call === 1) {
+          return [[{ COLUMN_TYPE: "enum('구강관리/양치습관','구치/구강건조','흡연/음주','우식성 식품 섭취','지각과민/불소','구강악습관','비점수 문진')" }]];
+        }
+        return [[]];
+      },
+    };
+    const result = await verifySurveyCodebookSchema(fakeConnection, 'bloomdent_test');
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.indexOk, false);
+  });
+
+  console.log(`\n🎉 ${passed}개 테스트 통과`);
+}
+
+runAsyncTests().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

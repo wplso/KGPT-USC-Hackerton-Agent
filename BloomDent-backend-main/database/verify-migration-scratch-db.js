@@ -65,6 +65,7 @@ async function runAgentSessionSmokeCheck(scratchDbName) {
   const agentRepository = require('../agent/repositories/agentRepository');
   const {
     decideReadiness,
+    buildSurveyAnswersOrError,
     buildContextSnapshot,
     computeContextHash,
     MODEL_NAME_PLACEHOLDER,
@@ -109,7 +110,7 @@ async function runAgentSessionSmokeCheck(scratchDbName) {
     historyId,
     surveySessionId: null,
     imagesByPosition: readiness.imagesByPosition,
-    surveyResponseRows: [],
+    surveyInfo: buildSurveyAnswersOrError([]),
   });
   const contextHash = computeContextHash(contextSnapshot);
   const sessionId = crypto.randomUUID();

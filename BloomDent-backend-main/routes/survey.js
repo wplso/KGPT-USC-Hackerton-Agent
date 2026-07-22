@@ -16,14 +16,19 @@ const CATEGORY = {
   ORAL_HABITS: '구강악습관',
 };
 
+// Agent 문진표(임상 배점 없음) 전용 category. 이 category로만 구성된 세션은
+// user_health_scores/score_history를 전혀 쓰지 않는다(오해성 0점 노출 방지).
+const NON_SCORING_CATEGORY = '비점수 문진';
+
 /**
  * 공통: 점수 계산 + user_health_scores / score_history 저장
  * - caller 가 트랜잭션(begin/commit/rollback)을 관리해야 함
  */
 async function calculateAndSaveSurveyScores(connection, user_id, session_id) {
-  // 1) 이번 세션의 응답(score, category) 조회
+  // 1) 이번 세션의 응답(question_number, score, category) 조회
   const [responses] = await connection.query(
-    `SELECT 
+    `SELECT
+       usr.question_number,
        usr.category,
        usr.score AS raw_score
      FROM user_survey_responses usr
@@ -35,6 +40,24 @@ async function calculateAndSaveSurveyScores(connection, user_id, session_id) {
   if (responses.length === 0) {
     throw new Error('설문 응답을 찾을 수 없습니다.');
   }
+
+  // 1-1) 비점수 문진 판정: 응답의 모든 category가 '비점수 문진'인지, 그리고
+  //      해당 question_number들의 survey_questions.max_score가 전부 0인지를
+  //      명시적으로 함께 확인한다(단순 totalMax===0 산술만으로 판정하지
+  //      않는다 — 기존 배점 설문에서 사용자가 우연히 0점 선택지만 고른
+  //      경우까지 "비점수"로 오판하면 안 되기 때문).
+  const isNonScoringByCategory = responses.every((row) => row.category === NON_SCORING_CATEGORY);
+
+  const respondedQuestionNumbers = [...new Set(responses.map((row) => row.question_number))];
+  const [questionRows] = await connection.query(
+    `SELECT question_number, max_score FROM survey_questions WHERE question_number IN (?)`,
+    [respondedQuestionNumbers]
+  );
+  const isNonScoringByMaxScore =
+    questionRows.length === respondedQuestionNumbers.length &&
+    questionRows.every((row) => Number(row.max_score) === 0);
+
+  const isNonScoringSession = isNonScoringByCategory && isNonScoringByMaxScore;
 
   // 2) 카테고리별 "실제 점수 문항 수" 조회 (score > 0 인 문항만 카운트)
   const [categoryStats] = await connection.query(
@@ -122,6 +145,20 @@ async function calculateAndSaveSurveyScores(connection, user_id, session_id) {
 
   const totalScore = totalMax > 0 ? (totalEarned / totalMax) * 100 : 0;
 
+  // totalMax===0 은 판정에 쓰지 않고 보조 무결성 검사로만 쓴다. isNonScoringSession
+  // 판정(category+max_score 명시적 확인)과 어긋나면(이론상 seed가 깨진 경우만
+  // 가능) 서버 로그로만 남기고, 실제 스코어링 여부는 isNonScoringSession을 따른다.
+  if (isNonScoringSession !== (totalMax === 0)) {
+    console.warn(
+      `[survey] 비점수 문진 판정 불일치: isNonScoringSession=${isNonScoringSession}, totalMax=${totalMax} (session=${session_id})`
+    );
+  }
+
+  if (isNonScoringSession) {
+    // 비점수 문진: user_health_scores/score_history를 전혀 쓰지 않는다.
+    return { scoring_status: 'not_applicable', scores_created: false, totalScore: null, categoryScores: null };
+  }
+
   // 6) user_health_scores upsert
   const [existing] = await connection.query(
     'SELECT id FROM user_health_scores WHERE user_id = ?',
@@ -201,7 +238,7 @@ async function calculateAndSaveSurveyScores(connection, user_id, session_id) {
     ]
   );
 
-  return { totalScore, categoryScores };
+  return { scoring_status: 'completed', scores_created: true, totalScore, categoryScores };
 }
 
 /**
@@ -293,6 +330,17 @@ router.post('/submit', async (req, res) => {
       });
     }
 
+    // 같은 question_number가 answers 배열에 두 번 이상 있으면 DB 쓰기 전에 거부한다.
+    const questionNumbers = answers.map((ans) => ans.question_number);
+    const uniqueQuestionNumbers = new Set(questionNumbers);
+    if (uniqueQuestionNumbers.size !== questionNumbers.length) {
+      return res.status(400).json({
+        success: false,
+        error_code: 'VALIDATION_ERROR',
+        message: 'answers 배열에 동일한 question_number가 중복으로 포함되어 있습니다.',
+      });
+    }
+
     await connection.beginTransaction();
 
     // 같은 세션의 이전 응답이 있으면 삭제(재제출 대비)
@@ -340,20 +388,32 @@ router.post('/submit', async (req, res) => {
       );
     }
 
-    // 모두 저장된 후 점수 계산 + health_scores + score_history
-    const { totalScore, categoryScores } = await calculateAndSaveSurveyScores(
-      connection,
-      user_id,
-      session_id
-    );
+    // 모두 저장된 후 점수 계산 + health_scores + score_history(비점수 문진이면 생략)
+    const scoreResult = await calculateAndSaveSurveyScores(connection, user_id, session_id);
 
     await connection.commit();
+
+    if (scoreResult.scoring_status === 'not_applicable') {
+      return res.json({
+        success: true,
+        message: '설문 응답이 저장되었습니다. 이 설문은 건강 점수 산정 대상이 아닙니다.',
+        data: {
+          survey_session_id: session_id,
+          scoring_status: 'not_applicable',
+          scores_created: false,
+        },
+      });
+    }
+
+    const { totalScore, categoryScores } = scoreResult;
 
     res.json({
       success: true,
       message: '설문 응답이 저장되고 점수가 계산되었습니다.',
       data: {
         survey_session_id: session_id,
+        scoring_status: 'completed',
+        scores_created: true,
         total_score: Number(totalScore.toFixed(2)),
         categories: {
           [CATEGORY.ORAL_CARE]: Number(
@@ -379,6 +439,13 @@ router.post('/submit', async (req, res) => {
     });
   } catch (error) {
     await connection.rollback();
+    if (error && error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({
+        success: false,
+        error_code: 'SURVEY_RESPONSE_DUPLICATE',
+        message: '이미 동일한 문항에 대한 응답이 존재합니다.',
+      });
+    }
     console.error('설문 전체 제출 오류:', error);
     res.status(500).json({
       success: false,
@@ -410,18 +477,26 @@ router.post('/calculate', async (req, res) => {
 
     await connection.beginTransaction();
 
-    const { totalScore, categoryScores } = await calculateAndSaveSurveyScores(
-      connection,
-      user_id,
-      session_id
-    );
+    const scoreResult = await calculateAndSaveSurveyScores(connection, user_id, session_id);
 
     await connection.commit();
+
+    if (scoreResult.scoring_status === 'not_applicable') {
+      return res.json({
+        success: true,
+        message: '이 설문은 건강 점수 산정 대상이 아닙니다.',
+        data: { scoring_status: 'not_applicable', scores_created: false },
+      });
+    }
+
+    const { totalScore, categoryScores } = scoreResult;
 
     res.json({
       success: true,
       message: '점수가 계산되어 저장되었습니다.',
       data: {
+        scoring_status: 'completed',
+        scores_created: true,
         total_score: Number(totalScore.toFixed(2)),
         categories: {
           [CATEGORY.ORAL_CARE]: Number(

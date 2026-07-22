@@ -5,11 +5,21 @@ const agentRepository = require('../repositories/agentRepository');
 const { agentError } = require('../shared/agentResponse');
 const {
   decideReadiness,
+  buildSurveyAnswersOrError,
   buildContextSnapshot,
   computeContextHash,
   MODEL_NAME_PLACEHOLDER,
   PROMPT_VERSION_PLACEHOLDER,
 } = require('../services/contextSnapshotService');
+
+// buildSurveyAnswersOrError()의 실패 code를 HTTP 상태로 매핑한다. DUPLICATE/
+// MAPPING_UNSUPPORTED는 응답 데이터 자체의 문제(422), CODEBOOK_MISMATCH는
+// Seed/코드북 정합성이 깨진 배포 문제로 본다(500).
+const SURVEY_VALIDATION_ERROR_STATUS_MAP = {
+  AGENT_SURVEY_RESPONSE_DUPLICATE: 422,
+  AGENT_SURVEY_MAPPING_UNSUPPORTED: 422,
+  AGENT_SURVEY_CODEBOOK_MISMATCH: 500,
+};
 
 function respondReady(res, statusCode, session) {
   return res.status(statusCode).json({
@@ -80,11 +90,21 @@ async function createSession(req, res) {
       return agentError(res, 422, 'ANALYSIS_FAILED', '사진 분석이 실패했습니다.', { retryable: true });
     }
 
+    // Codebook 기준으로 개별 설문 응답을 검증·매핑한다(Snapshot을 만들기 전에
+    // 반드시 통과해야 함 — 부분 Snapshot을 만들지 않는다).
+    const surveyInfo = buildSurveyAnswersOrError(surveyResponseRows);
+    if (!surveyInfo.ok) {
+      const status = SURVEY_VALIDATION_ERROR_STATUS_MAP[surveyInfo.code] || 500;
+      return agentError(res, status, surveyInfo.code, '설문 응답을 검증하는 중 문제가 발생했습니다.', {
+        retryable: false,
+      });
+    }
+
     const contextSnapshot = buildContextSnapshot({
       historyId,
       surveySessionId: surveySessionId || null,
       imagesByPosition: readiness.imagesByPosition,
-      surveyResponseRows,
+      surveyInfo,
     });
     const contextHash = computeContextHash(contextSnapshot);
 

@@ -26,7 +26,7 @@ async function findImageAnalysisByHistoryId(userId, historyId) {
 
 async function findSurveyResponsesBySessionId(userId, surveySessionId) {
   const [rows] = await pool.query(
-    `SELECT category, score
+    `SELECT question_number, option_number, category, score
      FROM user_survey_responses
      WHERE user_id = ? AND survey_session_id = ?`,
     [userId, surveySessionId]

@@ -113,6 +113,27 @@ const IMAGE_ANALYSIS_ALLOWED_ADD_INDEX_STATEMENTS = [
 const IMAGE_ANALYSIS_WIDEN_IMAGE_ID_STATEMENT =
   /^ALTER\s+TABLE\s+`?image_analysis`?\s+MODIFY\s+COLUMN\s+`?image_id`?\s+INT(?:\(\d+\))?\s+NULL$/i;
 
+// 003_extend_survey_for_agent_codebook.sql 전용 좁은 allowlist. image_analysis와
+// 동일한 원칙: "임의의 ALTER"가 아니라 정확히 이 문장 하나만(공백/개행은 유연하게)
+// 통과시킨다. 이 두 테이블에 대한 다른 ALTER는 전부 계속 차단된다.
+const SURVEY_QUESTION_OPTIONS_ALLOWED_ALTER_STATEMENT =
+  /^ALTER\s+TABLE\s+`?survey_question_options`?\s+MODIFY\s+COLUMN\s+`?category`?\s+ENUM\('구강관리\/양치습관','구치\/구강건조','흡연\/음주','우식성 식품 섭취','지각과민\/불소','구강악습관','비점수 문진'\)\s+NOT\s+NULL(\s+COMMENT\s+'[^']*')?$/i;
+
+const USER_SURVEY_RESPONSES_ALLOWED_ALTER_STATEMENT =
+  /^ALTER\s+TABLE\s+`?user_survey_responses`?\s+ADD\s+UNIQUE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+`?uq_user_survey_response_question`?\s*\(\s*user_id\s*,\s*survey_session_id\s*,\s*question_number\s*\)$/i;
+
+// 003 적용 후 검증용으로도 재사용하는 상수(테스트에서 실제 003 파일 텍스트와 대조)
+const SURVEY_CATEGORY_EXPECTED_ENUM_VALUES = [
+  '구강관리/양치습관',
+  '구치/구강건조',
+  '흡연/음주',
+  '우식성 식품 섭취',
+  '지각과민/불소',
+  '구강악습관',
+  '비점수 문진',
+];
+const USER_SURVEY_RESPONSE_EXPECTED_UNIQUE_INDEX = 'uq_user_survey_response_question';
+
 // 002 실행 후 information_schema 로 실제 반영됐는지 검증할 때도 동일하게 재사용하는
 // "정확히 이것만 있어야 한다" 목록 — allowlist 정규식과 이 상수들이 서로 어긋나지 않도록
 // run-migration.test.js 에서 실제 002 파일 텍스트와 대조하는 회귀 테스트를 둔다.
@@ -169,6 +190,44 @@ async function verifyImageAnalysisSchema(connection, dbName) {
 }
 
 /**
+ * 003 적용(UNIQUE INDEX 추가) 전, (user_id, survey_session_id, question_number)
+ * 중복이 이미 있는지 애플리케이션 레벨에서 먼저 확인한다. 중복이 있으면
+ * migration을 아예 실행하지 않는다(삭제·자동 병합 없음).
+ */
+async function checkNoDuplicateSurveyResponses(connection) {
+  const [rows] = await connection.query(
+    `SELECT user_id, survey_session_id, question_number, COUNT(*) AS c
+     FROM user_survey_responses
+     GROUP BY user_id, survey_session_id, question_number
+     HAVING COUNT(*) > 1`
+  );
+  return { duplicates: rows, ok: rows.length === 0 };
+}
+
+/**
+ * 003 적용 후 category ENUM에 '비점수 문진'이 추가됐고, UNIQUE INDEX가
+ * 실제로 생성됐는지 information_schema 로 검증한다.
+ */
+async function verifySurveyCodebookSchema(connection, dbName) {
+  const [columnRows] = await connection.query(
+    `SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'survey_question_options' AND COLUMN_NAME = 'category'`,
+    [dbName]
+  );
+  const columnType = columnRows[0]?.COLUMN_TYPE || '';
+  const enumOk = SURVEY_CATEGORY_EXPECTED_ENUM_VALUES.every((v) => columnType.includes(v));
+
+  const [indexRows] = await connection.query(
+    `SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'user_survey_responses' AND INDEX_NAME = ?`,
+    [dbName, USER_SURVEY_RESPONSE_EXPECTED_UNIQUE_INDEX]
+  );
+  const indexOk = indexRows.length > 0;
+
+  return { enumOk, indexOk, ok: enumOk && indexOk };
+}
+
+/**
  * EXPECTED_AGENT_TABLES 가 실제로 생성됐는지 information_schema 로 검증한다.
  */
 async function verifyAgentTablesExist(connection, dbName) {
@@ -214,6 +273,18 @@ function findSafetyViolations(rawSql) {
     if (!CORE_TABLES.includes(tableName)) continue;
 
     if (tableName === 'image_analysis' && isSafeImageAnalysisAlterStatement(statement)) {
+      continue;
+    }
+    if (
+      tableName === 'survey_question_options' &&
+      SURVEY_QUESTION_OPTIONS_ALLOWED_ALTER_STATEMENT.test(statement.trim())
+    ) {
+      continue;
+    }
+    if (
+      tableName === 'user_survey_responses' &&
+      USER_SURVEY_RESPONSES_ALLOWED_ALTER_STATEMENT.test(statement.trim())
+    ) {
       continue;
     }
 
@@ -299,6 +370,19 @@ async function main(argv = process.argv) {
     });
     console.log('✅ DB 연결 성공\n');
 
+    // 003 적용 전 (user_id, survey_session_id, question_number) 중복 여부를
+    // 먼저 확인한다. 중복이 있으면 어떤 SQL도 실행하지 않고 중단한다.
+    console.log('🔎 user_survey_responses 중복 응답 사전 검사:');
+    const dupCheck = await checkNoDuplicateSurveyResponses(connection);
+    if (!dupCheck.ok) {
+      console.error(`❌ (user_id, survey_session_id, question_number) 중복 ${dupCheck.duplicates.length}건 발견 — Migration을 중단합니다.`);
+      dupCheck.duplicates.forEach((d) =>
+        console.error(`     - user_id=${d.user_id}, survey_session_id=${d.survey_session_id}, question_number=${d.question_number} (${d.c}건)`)
+      );
+      process.exit(1);
+    }
+    console.log('   ✅ 중복 없음\n');
+
     for (const { file, sql } of loaded) {
       console.log(`🔧 적용 중: ${file}`);
       await connection.query(sql);
@@ -335,6 +419,18 @@ async function main(argv = process.argv) {
       process.exit(1);
     }
 
+    // 6) 검증: 003이 기대하는 category ENUM 값과 UNIQUE INDEX가 실제로 반영됐는지 확인
+    console.log('📋 설문 Codebook 스키마 정합성 검증 (003):');
+    const surveySchemaCheck = await verifySurveyCodebookSchema(connection, process.env.DB_NAME);
+    console.log(`   ${surveySchemaCheck.enumOk ? '✅' : '❌'} survey_question_options.category ENUM('비점수 문진' 포함)`);
+    console.log(`   ${surveySchemaCheck.indexOk ? '✅' : '❌'} user_survey_responses.${USER_SURVEY_RESPONSE_EXPECTED_UNIQUE_INDEX}`);
+    console.log('');
+
+    if (!surveySchemaCheck.ok) {
+      console.error('❌ 설문 Codebook 스키마가 003 기대값과 일치하지 않습니다.');
+      process.exit(1);
+    }
+
     console.log('🎉 Agent Migration 적용 및 검증 완료.');
   } catch (error) {
     console.error('\n❌ Migration 실행 중 오류:');
@@ -363,10 +459,16 @@ module.exports = {
   loadMigrationFiles,
   verifyImageAnalysisSchema,
   verifyAgentTablesExist,
+  checkNoDuplicateSurveyResponses,
+  verifySurveyCodebookSchema,
   EXPECTED_AGENT_TABLES,
   IMAGE_ANALYSIS_EXPECTED_COLUMNS,
   IMAGE_ANALYSIS_EXPECTED_INDEXES,
   IMAGE_ANALYSIS_NULLABLE_COLUMN,
+  SURVEY_QUESTION_OPTIONS_ALLOWED_ALTER_STATEMENT,
+  USER_SURVEY_RESPONSES_ALLOWED_ALTER_STATEMENT,
+  SURVEY_CATEGORY_EXPECTED_ENUM_VALUES,
+  USER_SURVEY_RESPONSE_EXPECTED_UNIQUE_INDEX,
   CORE_TABLES,
   MIGRATIONS_DIR,
 };

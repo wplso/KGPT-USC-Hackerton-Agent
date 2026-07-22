@@ -24,6 +24,11 @@
     "test:dental-pass-service": "node agent/services/dentalPassService.test.js",
     "test:dental-pass-controller": "node agent/controllers/dentalPassController.test.js",
     "test:no-store-cache": "node middleware/noStoreCache.test.js",
+    "test:survey-codebook": "node agent/catalog/surveyCodebook.test.js",
+    "test:survey-seed": "node database/run-seed.test.js",
+    "test:product-recommendation": "node agent/services/productRecommendationService.test.js",
+    "seed:survey": "node database/run-seed.js",
+    "seed:survey:check": "node database/run-seed.js --dry-run",
     "verify:migration-scratch-db": "node database/verify-migration-scratch-db.js",
     "migrate-position": "node database/migrate-position.js",
     "deploy": "bash deploy.sh"
