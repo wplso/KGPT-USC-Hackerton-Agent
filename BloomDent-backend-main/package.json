@@ -12,6 +12,7 @@
     "test:agent-migration": "node database/run-migration.test.js",
     "test:agent-auth": "node middleware/agentDemoAuth.test.js",
     "test:agent-sessions": "node agent/services/contextSnapshotService.test.js",
+    "test:agent-cost": "node agent/tools/calculateOopCost.test.js",
     "test:migration-scratch-db-guard": "node database/verify-migration-scratch-db.test.js",
     "verify:migration-scratch-db": "node database/verify-migration-scratch-db.js",
     "migrate-position": "node database/migrate-position.js",

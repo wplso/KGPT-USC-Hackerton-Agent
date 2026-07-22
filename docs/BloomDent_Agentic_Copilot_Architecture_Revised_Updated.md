@@ -329,6 +329,31 @@ Core DB에서 가져온 사용자 입력, 설문 자유 입력, AI 추천 문구
 
 ## 5.1 `calculate_oop_cost`
 
+> ⚠️ **Superseded for V1 (해커톤 구현 범위, 2026-07 승인)**
+>
+> 아래 §5.1 원본 스펙(`candidate_procedures`/`cdt_code`/`is_usc_student` 필수 입력,
+> `usc-demo-2026-07` fee schedule, USC 학생 클리닉 시나리오)은 이번 구현 단계에서
+> 다음과 같이 축소되어 구현되었다(`agent/tools/calculateOopCost.js`,
+> `agent/data/demoFeeSchedule.js`). 이 노트는 실제 구현이 원본 스펙과 다르다는
+> 사실만 기록하며, 원본 스펙 자체는 향후 참고를 위해 아래에 그대로 남겨둔다.
+>
+> - **USC 학생 할인 제외**: USC 학생 할인, USC 학생 신분 할인, Student Clinic 할인
+>   계산을 전부 제외한다. `is_usc_student`는 입력으로 받지 않으며 계산에 쓰이지 않는다.
+> - **실제 보험 계산 제외**: 실제 보험사별 보장률, deductible, annual maximum,
+>   coinsurance 추정을 하지 않는다. `coverage_status`가 `insured`/`unknown`이면
+>   숫자를 추정하지 않고 `needs_more_information` + `missing_information` 목록만 반환한다.
+> - **synthetic demo fee schedule만 사용**: 실제 USC 공식 가격, 실제 병원 가격 연동을
+>   전혀 하지 않는다. `agent/data/demoFeeSchedule.js`의 3개 항목(`initial_evaluation`,
+>   `basic_restorative_candidate`, `follow_up_review`)만 사용하며, 응답에 항상
+>   `source_type: "synthetic_demo"`와 `fee_schedule_version: "bloomdent-demo-2026-07"`를 포함한다.
+> - **scenarios 기반 V1 입력/출력 구조**: 원본의 단일 `candidate_procedures` 리스트
+>   대신, 서로 합산되지 않고 독립적으로 계산되는 `scenarios[].procedures[]` 배열
+>   구조를 사용한다(`procedure_id`는 서버 Allowlist 3종으로 제한, `cdt_code`/
+>   `confidence`/`tooth_region`은 입력받지 않는다).
+>
+> 이 구현 범위 밖의 다른 기능(Read-only Tool 실행 정책, 세션/메시지 API, Shopify,
+> Dental Pass 등)의 스펙은 변경되지 않았다.
+
 ### 목적
 
 가능한 치료 시나리오와 보험·학생 신분 정보를 이용해 예상 본인 부담금의 **범위와 계산 가정**을 반환한다.
