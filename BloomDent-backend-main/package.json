@@ -19,6 +19,11 @@
     "test:agent-message-controller": "node agent/controllers/messageController.test.js",
     "test:gemini-integration": "node agent/adapters/geminiAdapter.integration.test.js",
     "test:migration-scratch-db-guard": "node database/verify-migration-scratch-db.test.js",
+    "test:dental-pass-token": "node agent/shared/dentalPassToken.test.js",
+    "test:dental-pass-public-snapshot": "node agent/shared/dentalPassPublicSnapshot.test.js",
+    "test:dental-pass-service": "node agent/services/dentalPassService.test.js",
+    "test:dental-pass-controller": "node agent/controllers/dentalPassController.test.js",
+    "test:no-store-cache": "node middleware/noStoreCache.test.js",
     "verify:migration-scratch-db": "node database/verify-migration-scratch-db.js",
     "migrate-position": "node database/migrate-position.js",
     "deploy": "bash deploy.sh"

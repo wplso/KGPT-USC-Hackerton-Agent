@@ -490,6 +490,47 @@ Core DB에서 가져온 사용자 입력, 설문 자유 입력, AI 추천 문구
 
 ## 5.3 `generate_dental_pass`
 
+> ⚠️ **Superseded for V1 (2026-07-22 승인)**
+>
+> 아래 §5.3/§7.4/§7.5 원본 스펙은 이번 구현 단계에서 다음과 같이 축소·변경되어
+> 독립 API로 구현되었다(`agent/services/dentalPassService.js`,
+> `agent/controllers/dentalPassController.js`, `routes/agent.js`,
+> `routes/dentalPassPublic.js`). 이 노트는 실제 구현이 원본 스펙과 다르다는 사실만
+> 기록하며, 원본 스펙 자체는 향후 참고를 위해 아래에 그대로 남겨둔다.
+>
+> - **Gemini Tool Calling 미연동**: 이번 단계에서는 `generate_dental_pass`를
+>   Gemini Tool Registry(`agent/tools/toolRegistry.js`)에 등록하지 않는다.
+>   `confirmation_action_id`/`selected_finding_ids`는 받지 않으며, `proposed_actions`
+>   흐름과도 연결되지 않는다. 독립적인 REST API로 먼저 완성한 뒤, 다음 단계의
+>   Action Proposal 도입 시 연결한다.
+> - **입력 스키마 변경**: `{ confirmation_action_id, selected_finding_ids,
+>   expires_in_minutes }` 대신 `{ consent: true, expires_in_hours? }`를 받는다.
+>   `expires_in_minutes`(15~1440) 대신 `expires_in_hours`(1~168, 기본 24)를 사용한다.
+> - **엔드포인트 경로 변경**: `POST /sessions/:sessionId/actions/dental-pass` 대신
+>   `POST /api/agent/sessions/:sessionId/dental-pass`, `GET
+>   /api/agent/dental-passes/:shareToken` 대신 `GET /api/dental-pass/:shareToken`을
+>   사용한다(아래 "CLAUDE.md 예외" 참고).
+> - **공개 응답 필드 축소**: `chief_complaint`, `candidate_cdt_codes`,
+>   `cost_estimate`는 공개 응답에 포함하지 않는다(CDT 코드·보험·비용을 조작하지
+>   않는다는 안전 원칙 강화). 공개 응답은 `status`, `expires_at`,
+>   `summary.{schema_version, images[], survey, disclaimer}`만 포함하며,
+>   `images[]`는 `position/occlusion_status/cavity_detected/overall_score/
+>   recommendations` 5개 필드로 제한된 Allowlist다. `survey`는 V1에서 항상 `null`이다.
+> - **CLAUDE.md `/api/agent` 원칙에 대한 명시적 예외**: 공개 조회
+>   (`GET /api/dental-pass/:shareToken`)는 Demo Auth가 없는 공유 리소스이므로
+>   `/api/agent` 하위가 아닌 최상위 `/api/dental-pass`에 별도 라우터
+>   (`routes/dentalPassPublic.js`)로 마운트한다. 생성(POST)·철회(DELETE)는 여전히
+>   `/api/agent` 하위에서 Demo Auth를 요구한다.
+> - **Share Token**: `crypto.randomBytes(32)`의 base64url(43자, 256-bit entropy)을
+>   사용하고, DB에는 SHA-256 hash(64자 hex, `share_token_hash`)만 저장한다. 원문은
+>   생성 응답에서 단 한 번만 반환된다.
+> - **활성 Pass 개수 제한**: 세션당 활성(`status='active' AND expires_at > NOW()`)
+>   Pass 최대 3개, 초과 시 `409 ACTIVE_DENTAL_PASS_LIMIT_REACHED`.
+> - **draft 상태 비공개**: `status='draft'`인 Pass는 공개 조회에서 존재하지 않는
+>   것과 동일하게 `404 DENTAL_PASS_NOT_FOUND`로 처리한다.
+>
+> 이 구현 범위 밖의 다른 기능(§4~§5.2, §6~§9의 나머지 절)의 스펙은 변경되지 않았다.
+
 ### 목적
 
 프런트 데스크가 VOB와 접수 업무를 시작할 수 있도록 **VOB-ready Intake Packet**을 생성한다.
@@ -870,8 +911,9 @@ Content-Type: application/json
 >   `content`는 고정 안내 문구로 정규화된다.
 > - Tool 호출은 세션당 요청 1회에 최대 3회, 요청 전체 timeout 예산은 30초다.
 >
-> 이 구현 범위 밖의 다른 §7 엔드포인트(§7.3~7.5 Shopify/Dental Pass)의 스펙은
-> 변경되지 않았다.
+> 이 구현 범위 밖의 §7.3 Shopify 엔드포인트의 스펙은 변경되지 않았다. §7.4~7.5
+> Dental Pass는 이후 별도 세션에서 구현되었으며, 실제 계약은 §5.3 상단의
+> "Superseded for V1" 노트를 따른다(경로·입력·공개 응답 필드가 아래 원본과 다르다).
 
 ```http
 POST /api/agent/sessions/:sessionId/messages

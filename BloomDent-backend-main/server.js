@@ -26,6 +26,7 @@ const scoresRoutes = require('./routes/scores');
 const aiRoutes = require('./routes/ai');
 const surveyDetailRoutes = require('./routes/survey_detail');
 const agentRoutes = require('./routes/agent');
+const dentalPassPublicRoutes = require('./routes/dentalPassPublic');
 
 
 app.use('/api', apiRoutes);
@@ -38,6 +39,8 @@ app.use('/api/scores', scoresRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/survey-detail', surveyDetailRoutes);
 app.use('/api/agent', agentRoutes);
+// CLAUDE.md "/api/agent만" 원칙에 대한 명시적 예외 — routes/dentalPassPublic.js 상단 주석 참고.
+app.use('/api/dental-pass', dentalPassPublicRoutes);
 
 // 루트 경로
 app.get('/', (req, res) => {
