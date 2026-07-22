@@ -851,6 +851,28 @@ Content-Type: application/json
 
 ### 7.2 메시지 전송
 
+> ⚠️ **Superseded for V1 (Foundation 4 구현 범위, 2026-07 승인)**
+>
+> 아래 원본 스펙(`expected_session_version` 낙관적 동시성, 응답의 `agent_message`
+> 단일 문자열 + `evidence`(object) + `proposed_actions`, `session_version` 증가,
+> USC 학생 클리닉 시나리오/`usc-demo-2026-07`)은 이번 구현 단계에서 다음과 같이
+> 축소·변경되어 구현되었다(`agent/controllers/messageController.js`,
+> `agent/services/agentMessageService.js`):
+>
+> - **입력**: `{ message, client_message_id? }`만 받는다. `expected_session_version`은
+>   받지 않는다 — `session_version`은 V1에서 증가시키지 않는다(§5.1과 마찬가지로
+>   USC 학생 할인/실제 보험 계산 제외가 이어지는 결정).
+> - **출력**: `data.assistant_message = { id, role, response_mode, content, evidence(array),
+>   tool_results(array), needs_professional_review, disclaimer }` 구조를 쓴다.
+>   `proposed_actions`(Shopify/Dental Pass 제안)는 이번 범위에 없다(다음 단계 예정).
+> - **비용 안내**: Gemini의 자유 텍스트 `content`에는 비용 숫자를 넣지 않는다.
+>   실제 금액은 `calculate_oop_cost` Tool 결과를 서버가 `tool_results`로만 전달하고,
+>   `content`는 고정 안내 문구로 정규화된다.
+> - Tool 호출은 세션당 요청 1회에 최대 3회, 요청 전체 timeout 예산은 30초다.
+>
+> 이 구현 범위 밖의 다른 §7 엔드포인트(§7.3~7.5 Shopify/Dental Pass)의 스펙은
+> 변경되지 않았다.
+
 ```http
 POST /api/agent/sessions/:sessionId/messages
 ```

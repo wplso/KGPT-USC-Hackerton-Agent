@@ -56,6 +56,11 @@ app.use((req, res) => {
   });
 });
 
+// express.json() 파싱 실패(malformed JSON body)를 400으로 정규화 — 원본
+// parser 메시지/stack/요청 body를 노출하는 일반 500 핸들러로 넘어가지 않도록
+// 그 앞에 위치한다.
+app.use(require('./middleware/jsonParseErrorHandler'));
+
 // 전역 에러 핸들링
 app.use((err, req, res, next) => {
   console.error(err.stack);
