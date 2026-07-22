@@ -7,9 +7,13 @@
  * 안전 원칙 (CLAUDE.md "Database safety"):
  *   - setup-database.js(파괴적 전체 초기화)를 절대 사용하지 않는다.
  *   - database/migrations/*.sql 을 파일명 오름차순으로 실행한다.
- *   - 각 파일에 DROP / TRUNCATE / 기존 Core 테이블 ALTER 등 파괴적 구문이
- *     있으면 실행 자체를 거부한다(Fail-safe).
- *   - 실행 후 기대 Agent 테이블 존재 여부를 검증해 출력한다.
+ *   - 각 파일에 DROP / TRUNCATE / DELETE FROM 등 파괴적 구문이나 Core 테이블
+ *     ALTER 가 있으면 실행 자체를 거부한다(Fail-safe). 단 image_analysis 는
+ *     schema.sql과 실제 코드가 어긋나 있던 기존 드리프트를 보정하기 위해
+ *     nullable 컬럼 추가 / 인덱스 추가 / image_id NULL 완화라는 아주 좁은
+ *     패턴에 한해서만 예외적으로 허용한다(isSafeImageAnalysisAlterStatement).
+ *   - 실행 후 기대 Agent 테이블 존재 여부와, image_analysis 가 002 가 기대하는
+ *     컬럼/인덱스를 실제로 갖췄는지를 information_schema 로 검증해 출력한다.
  *
  * 사용법:
  *   node database/run-migration.js            # 실행
@@ -74,6 +78,111 @@ function stripSqlComments(sql) {
 }
 
 /**
+ * 세미콜론 기준으로 개별 SQL 문장을 분리한다.
+ * (이 프로젝트의 migration 파일은 문자열 리터럴에 세미콜론을 쓰지 않는다는 전제)
+ */
+function splitStatements(sql) {
+  return sql
+    .split(';')
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0);
+}
+
+// image_analysis 는 schema.sql(DDL)과 실제 실행 코드(routes/images.js, routes/ai.js)가
+// 오래전부터 어긋나 있던 유일한 Core 테이블이다(002_align_image_analysis_schema.sql 참고).
+// 이건 Agent가 Core 스키마를 새로 설계하는 게 아니라 이미 존재하던 드리프트를 복구하는
+// 호환성 Migration이므로, 여기서 허용하는 ALTER 도 "임의의 nullable 컬럼/인덱스 추가"가
+// 아니라 002가 실제로 필요로 하는 정확한 컬럼명·타입·인덱스명 9개 + image_id 완화 1개,
+// 딱 그만큼만 하드코딩된 allowlist로 허용한다. 그 외 모든 Core 테이블은 ALTER 자체가
+// 전면 차단되고, image_analysis 라도 이 목록에 없는 컬럼/인덱스명은 전부 차단된다.
+const IMAGE_ANALYSIS_ALLOWED_ADD_COLUMN_STATEMENTS = [
+  /^ALTER\s+TABLE\s+`?image_analysis`?\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+`?user_id`?\s+INT\s+NULL\s+AFTER\s+`?image_id`?$/i,
+  /^ALTER\s+TABLE\s+`?image_analysis`?\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+`?history_id`?\s+VARCHAR\(100\)\s+NULL\s+AFTER\s+`?user_id`?$/i,
+  /^ALTER\s+TABLE\s+`?image_analysis`?\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+`?cloudinary_url`?\s+TEXT\s+NULL\s+AFTER\s+`?history_id`?$/i,
+  /^ALTER\s+TABLE\s+`?image_analysis`?\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+`?image_type`?\s+VARCHAR\(50\)\s+NULL\s+AFTER\s+`?cloudinary_url`?$/i,
+  /^ALTER\s+TABLE\s+`?image_analysis`?\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+`?uploaded_at`?\s+TIMESTAMP\s+NULL\s+DEFAULT\s+CURRENT_TIMESTAMP\s+AFTER\s+`?image_type`?$/i,
+  /^ALTER\s+TABLE\s+`?image_analysis`?\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+`?analysis_status`?\s+ENUM\('pending','processing','completed','failed'\)\s+NULL\s+DEFAULT\s+'pending'\s+AFTER\s+`?uploaded_at`?$/i,
+  /^ALTER\s+TABLE\s+`?image_analysis`?\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+`?llm_summary`?\s+TEXT\s+NULL$/i,
+];
+
+const IMAGE_ANALYSIS_ALLOWED_ADD_INDEX_STATEMENTS = [
+  /^ALTER\s+TABLE\s+`?image_analysis`?\s+ADD\s+INDEX\s+IF\s+NOT\s+EXISTS\s+`?idx_image_analysis_history`?\s*\(\s*history_id\s*,\s*image_type\s*\)$/i,
+  /^ALTER\s+TABLE\s+`?image_analysis`?\s+ADD\s+INDEX\s+IF\s+NOT\s+EXISTS\s+`?idx_image_analysis_user`?\s*\(\s*user_id\s*,\s*history_id\s*\)$/i,
+];
+
+const IMAGE_ANALYSIS_WIDEN_IMAGE_ID_STATEMENT =
+  /^ALTER\s+TABLE\s+`?image_analysis`?\s+MODIFY\s+COLUMN\s+`?image_id`?\s+INT(?:\(\d+\))?\s+NULL$/i;
+
+// 002 실행 후 information_schema 로 실제 반영됐는지 검증할 때도 동일하게 재사용하는
+// "정확히 이것만 있어야 한다" 목록 — allowlist 정규식과 이 상수들이 서로 어긋나지 않도록
+// run-migration.test.js 에서 실제 002 파일 텍스트와 대조하는 회귀 테스트를 둔다.
+const IMAGE_ANALYSIS_EXPECTED_COLUMNS = [
+  'image_id',
+  'user_id',
+  'history_id',
+  'cloudinary_url',
+  'image_type',
+  'uploaded_at',
+  'analysis_status',
+  'llm_summary',
+];
+const IMAGE_ANALYSIS_NULLABLE_COLUMN = 'image_id';
+const IMAGE_ANALYSIS_EXPECTED_INDEXES = ['idx_image_analysis_history', 'idx_image_analysis_user'];
+
+function isSafeImageAnalysisAlterStatement(statement) {
+  const normalized = statement.trim();
+  return (
+    IMAGE_ANALYSIS_ALLOWED_ADD_COLUMN_STATEMENTS.some((re) => re.test(normalized)) ||
+    IMAGE_ANALYSIS_ALLOWED_ADD_INDEX_STATEMENTS.some((re) => re.test(normalized)) ||
+    IMAGE_ANALYSIS_WIDEN_IMAGE_ID_STATEMENT.test(normalized)
+  );
+}
+
+/**
+ * 002 적용 후 image_analysis 가 실제로 기대한 컬럼/인덱스를 갖췄는지
+ * information_schema 로 검증한다. DB 접근이 필요해 오프라인 유닛 테스트 대상은 아니다.
+ */
+async function verifyImageAnalysisSchema(connection, dbName) {
+  const [columnRows] = await connection.query(
+    `SELECT COLUMN_NAME, IS_NULLABLE FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'image_analysis' AND COLUMN_NAME IN (?)`,
+    [dbName, IMAGE_ANALYSIS_EXPECTED_COLUMNS]
+  );
+  const columnNullability = new Map(columnRows.map((r) => [r.COLUMN_NAME, r.IS_NULLABLE]));
+  const missingColumns = IMAGE_ANALYSIS_EXPECTED_COLUMNS.filter((c) => !columnNullability.has(c));
+  const imageIdNullable = columnNullability.get(IMAGE_ANALYSIS_NULLABLE_COLUMN) === 'YES';
+
+  const [indexRows] = await connection.query(
+    `SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'image_analysis' AND INDEX_NAME IN (?)`,
+    [dbName, IMAGE_ANALYSIS_EXPECTED_INDEXES]
+  );
+  const presentIndexes = new Set(indexRows.map((r) => r.INDEX_NAME));
+  const missingIndexes = IMAGE_ANALYSIS_EXPECTED_INDEXES.filter((i) => !presentIndexes.has(i));
+
+  return {
+    missingColumns,
+    imageIdNullable,
+    missingIndexes,
+    ok: missingColumns.length === 0 && imageIdNullable && missingIndexes.length === 0,
+  };
+}
+
+/**
+ * EXPECTED_AGENT_TABLES 가 실제로 생성됐는지 information_schema 로 검증한다.
+ */
+async function verifyAgentTablesExist(connection, dbName) {
+  const [rows] = await connection.query(
+    `SELECT TABLE_NAME FROM information_schema.TABLES
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME IN (?)`,
+    [dbName, EXPECTED_AGENT_TABLES]
+  );
+  const present = new Set(rows.map((r) => r.TABLE_NAME));
+  const missing = EXPECTED_AGENT_TABLES.filter((t) => !present.has(t));
+  return { present, missing, ok: missing.length === 0 };
+}
+
+/**
  * 하나의 Migration SQL 이 안전한지 검사한다.
  * 위반 시 사유 배열을 반환(빈 배열이면 안전).
  */
@@ -87,14 +196,28 @@ function findSafetyViolations(rawSql) {
     }
   }
 
-  // 기존 Core 테이블을 대상으로 하는 ALTER / DROP / CREATE 차단
+  // DROP / CREATE 는 예외 없이 모든 Core 테이블에서 차단
   for (const table of CORE_TABLES) {
-    const alter = new RegExp(`\\bALTER\\s+TABLE\\s+\`?${table}\`?\\b`, 'i');
     const drop = new RegExp(`\\bDROP\\s+TABLE\\s+(IF\\s+EXISTS\\s+)?\`?${table}\`?\\b`, 'i');
     const create = new RegExp(`\\bCREATE\\s+TABLE\\s+(IF\\s+NOT\\s+EXISTS\\s+)?\`?${table}\`?\\b`, 'i');
-    if (alter.test(sql)) violations.push(`Core 테이블 변경 시도(ALTER): ${table}`);
     if (drop.test(sql)) violations.push(`Core 테이블 삭제 시도(DROP): ${table}`);
     if (create.test(sql)) violations.push(`Core 테이블 재정의 시도(CREATE): ${table}`);
+  }
+
+  // ALTER 는 문장 단위로 검사한다: image_analysis 에 한해서만 좁은 allowlist를 통과하면
+  // 허용하고, 그 외 Core 테이블에 대한 ALTER 는 여전히 전부 차단한다.
+  for (const statement of splitStatements(sql)) {
+    const alterMatch = statement.match(/^ALTER\s+TABLE\s+`?(\w+)`?\b/i);
+    if (!alterMatch) continue;
+
+    const tableName = alterMatch[1].toLowerCase();
+    if (!CORE_TABLES.includes(tableName)) continue;
+
+    if (tableName === 'image_analysis' && isSafeImageAnalysisAlterStatement(statement)) {
+      continue;
+    }
+
+    violations.push(`Core 테이블 변경 시도(ALTER): ${tableName}`);
   }
 
   return violations;
@@ -184,24 +307,34 @@ async function main(argv = process.argv) {
 
     // 4) 검증: 기대 Agent 테이블 존재 확인
     console.log('📋 Agent 테이블 검증:');
-    const [rows] = await connection.query(
-      `SELECT TABLE_NAME FROM information_schema.TABLES
-        WHERE TABLE_SCHEMA = ? AND TABLE_NAME IN (?)`,
-      [process.env.DB_NAME, EXPECTED_AGENT_TABLES]
-    );
-    const present = new Set(rows.map((r) => r.TABLE_NAME));
-    let allOk = true;
+    const tableCheck = await verifyAgentTablesExist(connection, process.env.DB_NAME);
     for (const t of EXPECTED_AGENT_TABLES) {
-      const ok = present.has(t);
-      if (!ok) allOk = false;
-      console.log(`   ${ok ? '✅' : '❌'} ${t}`);
+      console.log(`   ${tableCheck.missing.includes(t) ? '❌' : '✅'} ${t}`);
     }
     console.log('');
 
-    if (!allOk) {
+    if (!tableCheck.ok) {
       console.error('❌ 일부 Agent 테이블이 생성되지 않았습니다.');
       process.exit(1);
     }
+
+    // 5) 검증: image_analysis 가 002 가 기대하는 컬럼/인덱스를 실제로 갖췄는지 확인
+    console.log('📋 image_analysis 스키마 정합성 검증 (002):');
+    const schemaCheck = await verifyImageAnalysisSchema(connection, process.env.DB_NAME);
+    for (const c of IMAGE_ANALYSIS_EXPECTED_COLUMNS) {
+      console.log(`   ${schemaCheck.missingColumns.includes(c) ? '❌' : '✅'} 컬럼 ${c}`);
+    }
+    console.log(`   ${schemaCheck.imageIdNullable ? '✅' : '❌'} image_id nullable`);
+    for (const idx of IMAGE_ANALYSIS_EXPECTED_INDEXES) {
+      console.log(`   ${schemaCheck.missingIndexes.includes(idx) ? '❌' : '✅'} 인덱스 ${idx}`);
+    }
+    console.log('');
+
+    if (!schemaCheck.ok) {
+      console.error('❌ image_analysis 스키마가 002 기대값과 일치하지 않습니다.');
+      process.exit(1);
+    }
+
     console.log('🎉 Agent Migration 적용 및 검증 완료.');
   } catch (error) {
     console.error('\n❌ Migration 실행 중 오류:');
@@ -224,9 +357,16 @@ if (require.main === module) {
 
 module.exports = {
   stripSqlComments,
+  splitStatements,
+  isSafeImageAnalysisAlterStatement,
   findSafetyViolations,
   loadMigrationFiles,
+  verifyImageAnalysisSchema,
+  verifyAgentTablesExist,
   EXPECTED_AGENT_TABLES,
+  IMAGE_ANALYSIS_EXPECTED_COLUMNS,
+  IMAGE_ANALYSIS_EXPECTED_INDEXES,
+  IMAGE_ANALYSIS_NULLABLE_COLUMN,
   CORE_TABLES,
   MIGRATIONS_DIR,
 };

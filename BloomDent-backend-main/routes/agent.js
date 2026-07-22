@@ -1,8 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const agentDemoAuth = require('../middleware/agentDemoAuth');
+const sessionController = require('../agent/controllers/sessionController');
 
 router.use(agentDemoAuth);
+
+router.post('/sessions', sessionController.createSession);
 
 router.get('/health', (req, res) => {
   res.json({
